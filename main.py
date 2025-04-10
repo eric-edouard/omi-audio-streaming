@@ -4,13 +4,11 @@ import logging
 import tempfile
 import struct
 import time
-import json # Added for Pub/Sub message
 from io import BytesIO
-from datetime import datetime, timezone # Added timezone
+from datetime import datetime
 
 from flask import Flask, request, Response
 from google.cloud import storage
-from google.cloud import pubsub_v1 # Added Pub/Sub client
 from google.oauth2 import service_account
 
 app = Flask(__name__)
@@ -22,151 +20,127 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Configuration & Constants ---
 # Constants matching the Go implementation
 NUM_CHANNELS = 1  # Mono audio
 SAMPLE_RATE = 16000
 BITS_PER_SAMPLE = 16  # 16 bits per sample
 
-# Environment Variables (ensure these are set in Cloud Run)
-GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
-GOOGLE_APPLICATION_CREDENTIALS_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON") # For GCS upload as implemented
-PUB_SUB_TOPIC_ID = os.environ.get("PUB_SUB_TOPIC_ID") # ADD THIS ENV VAR
-PROJECT_ID = os.environ.get("GCP_PROJECT") # Needed for Pub/Sub Topic Path
-
-# --- Initialize Clients ---
-# Storage Client (using explicit credentials as provided in original code)
-# Note: Standard practice in Cloud Run is usually to rely on the attached service account (ADC)
-#       instead of explicit key files, but we retain the original method here for GCS.
-storage_client = None
-if GOOGLE_APPLICATION_CREDENTIALS_JSON:
-    try:
-        creds_json_bytes = base64.b64decode(GOOGLE_APPLICATION_CREDENTIALS_JSON)
-        # Use temporary file for credentials - consider security implications
-        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as creds_file:
-            creds_file.write(creds_json_bytes)
-            creds_path = creds_file.name
-        credentials = service_account.Credentials.from_service_account_file(creds_path)
-        storage_client = storage.Client(credentials=credentials, project=PROJECT_ID) # Specify project for client
-        os.remove(creds_path) # Clean up temp file immediately after client creation
-        logger.info("Storage Client initialized using provided credentials JSON.")
-    except Exception as e:
-        logger.error(f"Failed to initialize Storage Client from JSON credentials: {e}", exc_info=True)
-        # Decide if the app should fail to start or continue without storage client
-        storage_client = None # Ensure it's None if init fails
-else:
-    logger.warning("GOOGLE_APPLICATION_CREDENTIALS_JSON not set. Storage Client not initialized with explicit credentials.")
-    # Attempt to initialize using ADC (will use Cloud Run service account)
-    try:
-        storage_client = storage.Client(project=PROJECT_ID)
-        logger.info("Storage Client initialized using Application Default Credentials.")
-    except Exception as e:
-        logger.error(f"Failed to initialize Storage Client using Application Default Credentials: {e}", exc_info=True)
-        storage_client = None
-
-# Pub/Sub Publisher Client (using standard ADC via Cloud Run service account)
-publisher = None
-topic_path = None
-if PROJECT_ID and PUB_SUB_TOPIC_ID:
-    try:
-        publisher = pubsub_v1.PublisherClient()
-        topic_path = publisher.topic_path(PROJECT_ID, PUB_SUB_TOPIC_ID)
-        logger.info(f"Pub/Sub Publisher Client initialized for topic: {topic_path}")
-    except Exception as e:
-        logger.error(f"Failed to initialize Pub/Sub Publisher Client: {e}", exc_info=True)
-else:
-    logger.warning("GCP_PROJECT or PUBSUB_TOPIC_ID not set. Pub/Sub Publisher not initialized.")
-
-
 def create_wav_header(data_length):
     """Generate a WAV header for the given data length"""
-    logger.debug(f"Creating WAV header for data length: {data_length} bytes") # Changed to debug
+    logger.info(f"Creating WAV header for data length: {data_length} bytes")
     byte_rate = SAMPLE_RATE * NUM_CHANNELS * BITS_PER_SAMPLE // 8
     block_align = NUM_CHANNELS * BITS_PER_SAMPLE // 8
     header = BytesIO()
+    
+    # RIFF header
     header.write(b"RIFF")
-    header.write(struct.pack("<I", 36 + data_length))
+    header.write(struct.pack("<I", 36 + data_length))  # File size
     header.write(b"WAVE")
+    
+    # fmt chunk
     header.write(b"fmt ")
-    header.write(struct.pack("<I", 16))
-    header.write(struct.pack("<H", 1))
+    header.write(struct.pack("<I", 16))  # Chunk size
+    header.write(struct.pack("<H", 1))   # Format code (PCM)
     header.write(struct.pack("<H", NUM_CHANNELS))
     header.write(struct.pack("<I", SAMPLE_RATE))
     header.write(struct.pack("<I", byte_rate))
     header.write(struct.pack("<H", block_align))
     header.write(struct.pack("<H", BITS_PER_SAMPLE))
+    
+    # data chunk
     header.write(b"data")
     header.write(struct.pack("<I", data_length))
-    logger.debug(f"WAV header created. Header size: {len(header.getvalue())} bytes") # Changed to debug
+    
+    logger.debug(f"WAV header created successfully. Header size: {len(header.getvalue())} bytes")
     return header.getvalue()
 
-def upload_file_to_gcs_internal(bucket_name, file_name, file_path):
-    """Internal GCS upload function using the initialized client"""
+def upload_file_to_gcs(bucket_name, file_name, file_path):
+    """Upload a file to Google Cloud Storage"""
     logger.info(f"Starting upload to GCS bucket: {bucket_name}, file: {file_name}")
-    if not storage_client:
-        logger.error("Storage client is not initialized. Cannot upload.")
-        raise ConnectionError("Storage client not initialized") # More specific error
-
+    
     try:
-        bucket = storage_client.bucket(bucket_name)
-        blob = bucket.blob(file_name) # Define GCS path within bucket
-
-        logger.info(f"Uploading file {file_path} to gs://{bucket_name}/{file_name}")
-        file_size = os.path.getsize(file_path)
-        logger.debug(f"File size: {file_size} bytes")
-
-        start_time = time.time()
-        blob.upload_from_filename(file_path)
-        # Setting content type after upload is generally okay
-        blob.content_type = "audio/wav"
-        blob.patch() # Make sure content type is saved
-        end_time = time.time()
-
-        upload_duration = end_time - start_time
-        logger.info(f"File {file_name} uploaded to GCS successfully in {upload_duration:.2f} seconds")
-        return f"gs://{bucket_name}/{file_name}" # Return the GCS URI
+        # Get credentials from environment variable
+        logger.debug("Reading GCS credentials from environment variable")
+        creds_env = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+        if not creds_env:
+            logger.error("GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable is not set")
+            raise ValueError("GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable is not set")
+        
+        # Decode the base64 encoded credentials
+        logger.debug("Decoding base64 credentials")
+        try:
+            creds_json = base64.b64decode(creds_env)
+            logger.debug("Credentials decoded successfully")
+        except Exception as e:
+            logger.error(f"Failed to decode credentials: {e}")
+            raise
+        
+        # Create a temporary file for the credentials
+        logger.debug("Creating temporary file for credentials")
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as creds_file:
+            creds_file.write(creds_json)
+            creds_path = creds_file.name
+            logger.debug(f"Credentials written to temporary file: {creds_path}")
+        
+        try:
+            # Create credentials object and storage client
+            logger.debug("Creating storage client with credentials")
+            credentials = service_account.Credentials.from_service_account_file(creds_path)
+            client = storage.Client(credentials=credentials)
+            
+            # Upload file to bucket
+            logger.info(f"Uploading file {file_path} to bucket {bucket_name}")
+            file_size = os.path.getsize(file_path)
+            logger.debug(f"File size: {file_size} bytes")
+            
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(file_name)
+            
+            # Start upload with logging
+            start_time = time.time()
+            blob.upload_from_filename(file_path)
+            end_time = time.time()
+            
+            blob.content_type = "audio/wav"
+            upload_duration = end_time - start_time
+            logger.info(f"File {file_name} uploaded to GCS bucket {bucket_name} successfully in {upload_duration:.2f} seconds")
+            return True
+        finally:
+            # Clean up temporary credentials file
+            logger.debug(f"Removing temporary credentials file: {creds_path}")
+            os.remove(creds_path)
+            
     except Exception as e:
-        logger.error(f"Failed to upload {file_name} to GCS: {e}", exc_info=True)
-        raise # Re-raise the exception
-
+        logger.error(f"Failed to upload to GCS: {e}", exc_info=True)
+        raise
 
 @app.route('/audio', methods=['POST'])
 def handle_post_audio():
     """Handle audio POST requests"""
-    start_request_time = time.time()
+    start_time = time.time()
     logger.info("Received /audio POST request")
-
-    if not GCS_BUCKET_NAME:
-        error_msg = "GCS_BUCKET_NAME environment variable is not set"
-        logger.error(error_msg)
-        return Response(error_msg, status=500)
-    if not publisher or not topic_path:
-        error_msg = "Pub/Sub publisher not initialized (check GCP_PROJECT, PUBSUB_TOPIC_ID env vars)"
-        logger.error(error_msg)
-        return Response(error_msg, status=500)
-
+    
+    sample_rate = request.args.get('sample_rate')
+    uid = request.args.get('uid')
+    
+    logger.info(f"Request details - UID: {uid}, Sample rate: {sample_rate}")
+    
     # Read audio data from request body
     audio_data = request.get_data()
-    if not audio_data:
-         logger.warning("Received empty audio data in request.")
-         return Response("No audio data received.", status=400)
     logger.info(f"Received {len(audio_data)} bytes of audio data")
-
-    # Generate filename with current timestamp (add microseconds for better uniqueness)
-    # Using UTC is recommended for consistency
-    current_time_utc = datetime.now(timezone.utc)
-    # Format: YYYY-MM-DD_HH-MM-SS-ffffff.wav (ISO-like, sortable, unique)
-    filename = f"{current_time_utc.strftime('%Y-%m-%d_%H-%M-%S-%f')}.wav"
-    gcs_blob_name = f"raw_audio/{filename}" # Assume a prefix for raw files
-    logger.info(f"Generated GCS blob name: {gcs_blob_name}")
-
+    
+    # Generate filename with current timestamp
+    current_time = datetime.now()
+    filename = f"{current_time.day:02d}_{current_time.month:02d}_{current_time.year:04d}_{current_time.hour:02d}_{current_time.minute:02d}_{current_time.second:02d}.wav"
+    logger.info(f"Generated filename: {filename}")
+    
     # Create temporary file
     temp_file_path = os.path.join(tempfile.gettempdir(), filename)
     logger.debug(f"Temporary file path: {temp_file_path}")
-
+    
     # Generate WAV header
     header = create_wav_header(len(audio_data))
-
+    
     # Write to temporary file
     logger.debug(f"Writing WAV header and audio data to temporary file")
     try:
@@ -176,50 +150,25 @@ def handle_post_audio():
         logger.debug(f"Successfully wrote data to temporary file: {temp_file_path}")
     except Exception as e:
         logger.error(f"Failed to write to temporary file: {e}", exc_info=True)
-        # Clean up if file exists before returning error
-        if os.path.exists(temp_file_path): os.remove(temp_file_path)
         return Response(f"Failed to write temporary file: {str(e)}", status=500)
-
-    gcs_uri = None
+    
+    # Get bucket name from environment variable
+    bucket_name = os.environ.get("GCS_BUCKET_NAME")
+    if not bucket_name:
+        error_msg = "GCS_BUCKET_NAME environment variable is not set"
+        logger.error(error_msg)
+        return Response(error_msg, status=500)
+    
     try:
         # Upload the file to Google Cloud Storage
-        gcs_uri = upload_file_to_gcs_internal(GCS_BUCKET_NAME, gcs_blob_name, temp_file_path)
-
-        # ---- ADDED: Publish to Pub/Sub ----
-        message_data = {
-            "gcsUri": gcs_uri,
-            "filename": filename, # Keep original generated filename maybe? Or blob name?
-            "timestamp": current_time_utc.isoformat() # Use precise ISO 8601 timestamp
-        }
-        message_json = json.dumps(message_data)
-        message_bytes = message_json.encode('utf-8')
-
-        try:
-            publish_future = publisher.publish(topic_path, data=message_bytes)
-            # Let publish happen asynchronously for lower latency, but log errors
-            publish_future.add_done_callback(
-                lambda future: logger.info(f"Pub/Sub message for {filename} published successfully.")
-                if not future.exception() else
-                logger.error(f"Failed to publish Pub/Sub message for {filename}: {future.exception()}")
-            )
-            # For critical paths you might use publish_future.result(timeout=...)
-        except Exception as e:
-            logger.error(f"Error initiating publish to Pub/Sub topic {topic_path}: {e}", exc_info=True)
-            # Decide how to handle: GCS upload succeeded but Pub/Sub failed.
-            # Maybe log prominently, or attempt retry? For now, log and continue.
-            # The request still succeeded in saving the file.
-
-        # ------------------------------------
-
-        end_request_time = time.time()
-        total_processing_time = end_request_time - start_request_time
-        logger.info(f"Request processed successfully (GCS + Pub/Sub triggered) in {total_processing_time:.2f} seconds")
-        return Response(f"Audio bytes received, uploaded as {gcs_blob_name}, notification sent.", status=200)
-
+        upload_file_to_gcs(bucket_name, filename, temp_file_path)
+        end_time = time.time()
+        total_processing_time = end_time - start_time
+        logger.info(f"Request processed successfully in {total_processing_time:.2f} seconds")
+        return Response(f"Audio bytes received and uploaded as {filename}", status=200)
     except Exception as e:
-        # This catches GCS upload errors mostly
-        logger.error(f"Failed during GCS upload: {str(e)}", exc_info=True)
-        return Response(f"Failed during GCS upload: {str(e)}", status=500)
+        logger.error(f"Failed to upload to Google Cloud Storage: {str(e)}", exc_info=True)
+        return Response(f"Failed to upload to Google Cloud Storage: {str(e)}", status=500)
     finally:
         # Clean up the temporary file
         if os.path.exists(temp_file_path):
@@ -229,27 +178,27 @@ def handle_post_audio():
             except Exception as e:
                 logger.warning(f"Failed to remove temporary file {temp_file_path}: {e}")
 
-
 @app.route('/health', methods=['GET'])
 def health_check():
     """Simple health check endpoint"""
-    # Could add checks for GCS/PubSub client initialization here
-    logger.debug("Health check request received") # Changed to debug
+    logger.info("Health check request received")
     return Response("OK", status=200)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     logger.info(f"Starting server on port {port}...")
-    # Log critical env vars on startup
-    logger.info(f"GCS_BUCKET_NAME: {GCS_BUCKET_NAME or 'Not Set!'}")
-    logger.info(f"GCP_PROJECT: {PROJECT_ID or 'Not Set!'}")
-    logger.info(f"PUBSUB_TOPIC_ID: {PUB_SUB_TOPIC_ID or 'Not Set!'}")
-    logger.info(f"GOOGLE_APPLICATION_CREDENTIALS_JSON: {'Set' if GOOGLE_APPLICATION_CREDENTIALS_JSON else 'Not Set'}")
-
-    # Basic check for client initialization
-    if not storage_client:
-         logger.error("Storage client failed to initialize on startup!")
-    if not publisher:
-         logger.error("Pub/Sub publisher failed to initialize on startup!")
-
-    app.run(host='0.0.0.0', port=port)
+    logger.info(f"Environment details - Python version: {os.sys.version}")
+    logger.info(f"Configured for: NUM_CHANNELS={NUM_CHANNELS}, SAMPLE_RATE={SAMPLE_RATE}, BITS_PER_SAMPLE={BITS_PER_SAMPLE}")
+    
+    # Check if required environment variables are set
+    if os.environ.get("GCS_BUCKET_NAME"):
+        logger.info(f"GCS_BUCKET_NAME is set to: {os.environ.get('GCS_BUCKET_NAME')}")
+    else:
+        logger.warning("GCS_BUCKET_NAME environment variable is not set!")
+        
+    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON"):
+        logger.info("GOOGLE_APPLICATION_CREDENTIALS_JSON is set")
+    else:
+        logger.warning("GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable is not set!")
+    
+    app.run(host='0.0.0.0', port=port) 
