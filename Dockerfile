@@ -1,12 +1,8 @@
-FROM golang:1.22.1-alpine AS builder
+FROM python:3.10-slim
 WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-RUN go mod download
-RUN go build -o ./omi-audio-streaming ./main.go
- 
- 
-FROM alpine:latest AS runner
-WORKDIR /app
-COPY --from=builder /app/omi-audio-streaming .
 EXPOSE 8080
-ENTRYPOINT ["./omi-audio-streaming"]
+ENV PORT=8080
+CMD ["python", "main.py"]
