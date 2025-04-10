@@ -4,6 +4,8 @@ import logging
 import tempfile
 import struct
 import time
+import numpy as np
+import pyogg
 from io import BytesIO
 from datetime import datetime
 
@@ -122,8 +124,9 @@ def handle_post_audio():
     
     sample_rate = request.args.get('sample_rate')
     uid = request.args.get('uid')
+    codec = request.args.get('codec')
     
-    logger.info(f"Request details - UID: {uid}, Sample rate: {sample_rate}")
+    logger.info(f"Request details - UID: {uid}, Sample rate: {sample_rate}, Codec: {codec}")
     
     # Read audio data from request body
     audio_data = request.get_data()
@@ -138,19 +141,46 @@ def handle_post_audio():
     temp_file_path = os.path.join(tempfile.gettempdir(), filename)
     logger.debug(f"Temporary file path: {temp_file_path}")
     
-    # Generate WAV header
-    header = create_wav_header(len(audio_data))
-    
-    # Write to temporary file
-    logger.debug(f"Writing WAV header and audio data to temporary file")
-    try:
-        with open(temp_file_path, 'wb') as temp_file:
-            temp_file.write(header)
-            temp_file.write(audio_data)
-        logger.debug(f"Successfully wrote data to temporary file: {temp_file_path}")
-    except Exception as e:
-        logger.error(f"Failed to write to temporary file: {e}", exc_info=True)
-        return Response(f"Failed to write temporary file: {str(e)}", status=500)
+    # Process audio data based on codec
+    if codec and codec.lower() == 'opus':
+        logger.info("Processing Opus encoded audio data")
+        try:
+            # Decode the Opus data to PCM using OpusDecoder
+            decoder = pyogg.OpusDecoder()
+            decoder.set_channels(NUM_CHANNELS)
+            decoder.set_sampling_frequency(SAMPLE_RATE)
+            
+            pcm_data = decoder.decode(audio_data)
+            logger.debug(f"Opus data decoded successfully, got {len(pcm_data)} bytes of PCM data")
+            
+            # Convert PCM data to numpy array
+            pcm_array = np.frombuffer(pcm_data, dtype=np.int16)
+            
+            # Write to temporary file using wave module
+            import wave
+            with wave.open(temp_file_path, 'wb') as wav_file:
+                wav_file.setnchannels(NUM_CHANNELS)
+                wav_file.setsampwidth(BITS_PER_SAMPLE // 8)  # Convert bits to bytes
+                wav_file.setframerate(SAMPLE_RATE)
+                wav_file.writeframes(pcm_array.tobytes())
+            logger.debug(f"Successfully wrote decoded Opus data to WAV file: {temp_file_path}")
+        except Exception as e:
+            logger.error(f"Failed to decode Opus data: {e}", exc_info=True)
+            return Response(f"Failed to decode Opus data: {str(e)}", status=500)
+    else:
+        # Generate WAV header for raw audio
+        header = create_wav_header(len(audio_data))
+        
+        # Write to temporary file
+        logger.debug(f"Writing WAV header and raw audio data to temporary file")
+        try:
+            with open(temp_file_path, 'wb') as temp_file:
+                temp_file.write(header)
+                temp_file.write(audio_data)
+            logger.debug(f"Successfully wrote data to temporary file: {temp_file_path}")
+        except Exception as e:
+            logger.error(f"Failed to write to temporary file: {e}", exc_info=True)
+            return Response(f"Failed to write temporary file: {str(e)}", status=500)
     
     # Get bucket name from environment variable
     bucket_name = os.environ.get("GCS_BUCKET_NAME")
